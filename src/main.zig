@@ -24,10 +24,18 @@ const PerfConfig = union(PerfType) {
     raw: struct {
         event: u8 = 0,
         umask: u8 = 0,
+        edge: u8 = 0,
+        inv: u8 = 0,
+        cmask: u8 = 0,
 
         const Self = @This();
         pub fn value(self: Self) u64 {
-            return @as(u64, self.event) | @as(u64, self.umask) << 8;
+            // Based on: https://github.com/Maratyszcza/NNPACK/blob/70a77f4/bench/perf_counter.c#L717-L721
+            return (@as(u64, self.event) |
+                @as(u64, self.umask) << 8 |
+                @as(u64, self.edge) << 18 |
+                @as(u64, self.inv) << 23 |
+                @as(u64, self.cmask) << 24);
         }
     },
 
@@ -71,6 +79,10 @@ const perf_measurements = [_]PerfMeasurement{
         .name = "mem_ld_rt_fbh", // mem_load_retired.fb_hit
         .config = .{ .raw = .{ .event = 0xd1, .umask = 0x40 } },
     },
+    .{
+        .name = "res_stalls_sb", // resource_stalls.sb
+        .config = .{ .raw = .{ .event = 0xa2, .umask = 0x08 } },
+    },
 };
 
 // nah, i don't want to fix the name length issue for now...
@@ -98,6 +110,7 @@ const Command = struct {
         branch_misses: Measurement,
         idq_uops_nd_core: Measurement,
         mem_ld_rt_fbh: Measurement,
+        res_stalls_sb: Measurement,
     };
 };
 
@@ -111,6 +124,7 @@ const Sample = struct {
     peak_rss: u64,
     idq_uops_nd_core: u64,
     mem_ld_rt_fbh: u64,
+    res_stalls_sb: u64,
 
     pub fn lessThanContext(comptime field: []const u8) type {
         return struct {
@@ -348,6 +362,7 @@ pub fn main() !void {
                 .branch_misses = readPerfFd(perf_fds[4]),
                 .idq_uops_nd_core = readPerfFd(perf_fds[5]),
                 .mem_ld_rt_fbh = readPerfFd(perf_fds[6]),
+                .res_stalls_sb = readPerfFd(perf_fds[7]),
             };
             for (&perf_fds) |*perf_fd| {
                 std.posix.close(perf_fd.*);
@@ -384,6 +399,7 @@ pub fn main() !void {
             .branch_misses = Measurement.compute(all_samples, "branch_misses", .count),
             .idq_uops_nd_core = Measurement.compute(all_samples, "idq_uops_nd_core", .count),
             .mem_ld_rt_fbh = Measurement.compute(all_samples, "mem_ld_rt_fbh", .count),
+            .res_stalls_sb = Measurement.compute(all_samples, "res_stalls_sb", .count),
         };
         command.sample_count = all_samples.len;
 
