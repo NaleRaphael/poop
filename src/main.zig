@@ -31,7 +31,7 @@ const PerfConfig = union(PerfType) {
         }
     },
 
-    pub fn toU64(self: PerfConfig) u64 {
+    pub fn value(self: PerfConfig) u64 {
         return switch (self) {
             .hw => |v| @intFromEnum(v),
             .raw => |v| v.value(),
@@ -244,7 +244,7 @@ pub fn main() !void {
             for (perf_measurements, &perf_fds) |measurement, *perf_fd| {
                 var attr: std.os.linux.perf_event_attr = .{
                     .type = measurement.config.perfType(),
-                    .config = measurement.config.toU64(),
+                    .config = measurement.config.value(),
                     .flags = .{
                         .disabled = true,
                         .exclude_kernel = true,
