@@ -18,18 +18,69 @@ const usage_text =
     \\
 ;
 
-const PerfMeasurement = struct {
-    name: []const u8,
-    config: PERF.COUNT.HW,
+const PerfType = enum { hw, raw };
+const PerfConfig = union(PerfType) {
+    hw: PERF.COUNT.HW,
+    raw: struct {
+        event: u8 = 0,
+        umask: u8 = 0,
+
+        const Self = @This();
+        pub fn value(self: Self) u64 {
+            return @as(u64, self.event) | @as(u64, self.umask) << 8;
+        }
+    },
+
+    pub fn toU64(self: PerfConfig) u64 {
+        return switch (self) {
+            .hw => |v| @intFromEnum(v),
+            .raw => |v| v.value(),
+        };
+    }
+
+    pub fn perfType(self: PerfConfig) PERF.TYPE {
+        return switch (self) {
+            .hw => PERF.TYPE.HARDWARE,
+            .raw => PERF.TYPE.RAW,
+        };
+    }
 };
 
-const perf_measurements = [_]PerfMeasurement{
-    .{ .name = "cpu_cycles", .config = PERF.COUNT.HW.CPU_CYCLES },
-    .{ .name = "instructions", .config = PERF.COUNT.HW.INSTRUCTIONS },
-    .{ .name = "cache_references", .config = PERF.COUNT.HW.CACHE_REFERENCES },
-    .{ .name = "cache_misses", .config = PERF.COUNT.HW.CACHE_MISSES },
-    .{ .name = "branch_misses", .config = PERF.COUNT.HW.BRANCH_MISSES },
+const PerfMeasurement = struct {
+    name: []const u8,
+    config: PerfConfig,
 };
+
+// NOTE: Some useful resources for defining new measurements:
+// https://github.com/Maratyszcza/NNPACK/blob/master/bench/perf_counter.c
+// https://github.com/torvalds/linux/blob/7ff71e6d/arch/x86/events/intel/core.c#L6812-L6817
+// https://github.com/torvalds/linux/blob/7ff71e6d/arch/x86/events/perf_event.h#L637-L658
+const perf_measurements = [_]PerfMeasurement{
+    .{ .name = "cpu_cycles", .config = .{ .hw = PERF.COUNT.HW.CPU_CYCLES } },
+    .{ .name = "instructions", .config = .{ .hw = PERF.COUNT.HW.INSTRUCTIONS } },
+    .{ .name = "cache_references", .config = .{ .hw = PERF.COUNT.HW.CACHE_REFERENCES } },
+    .{ .name = "cache_misses", .config = .{ .hw = PERF.COUNT.HW.CACHE_MISSES } },
+    .{ .name = "branch_misses", .config = .{ .hw = PERF.COUNT.HW.BRANCH_MISSES } },
+    .{
+        // XXX: If we want to support longer name, remember to fix the space
+        // calculation in `printMeasurement()` below.
+        .name = "idq_uops_nd_core", // idq_uops_not_delivered.core
+        .config = .{ .raw = .{ .event = 0x9c, .umask = 0x01 } },
+    },
+    .{
+        .name = "mem_ld_rt_fbh", // mem_load_retired.fb_hit
+        .config = .{ .raw = .{ .event = 0xd1, .umask = 0x40 } },
+    },
+};
+
+// nah, i don't want to fix the name length issue for now...
+comptime {
+    for (perf_measurements) |m| {
+        if (m.name.len > 16) {
+            @compileError(std.fmt.comptimePrint("Please consider restricting the name within 16 characters: {s}", .{m.name}));
+        }
+    }
+}
 
 const Command = struct {
     raw_cmd: []const u8,
@@ -45,6 +96,8 @@ const Command = struct {
         cache_references: Measurement,
         cache_misses: Measurement,
         branch_misses: Measurement,
+        idq_uops_nd_core: Measurement,
+        mem_ld_rt_fbh: Measurement,
     };
 };
 
@@ -56,6 +109,8 @@ const Sample = struct {
     cache_misses: u64,
     branch_misses: u64,
     peak_rss: u64,
+    idq_uops_nd_core: u64,
+    mem_ld_rt_fbh: u64,
 
     pub fn lessThanContext(comptime field: []const u8) type {
         return struct {
@@ -188,8 +243,8 @@ pub fn main() !void {
             if (tty_conf != .no_color) try bar.render();
             for (perf_measurements, &perf_fds) |measurement, *perf_fd| {
                 var attr: std.os.linux.perf_event_attr = .{
-                    .type = PERF.TYPE.HARDWARE,
-                    .config = @intFromEnum(measurement.config),
+                    .type = measurement.config.perfType(),
+                    .config = measurement.config.toU64(),
                     .flags = .{
                         .disabled = true,
                         .exclude_kernel = true,
@@ -291,6 +346,8 @@ pub fn main() !void {
                 .cache_references = readPerfFd(perf_fds[2]),
                 .cache_misses = readPerfFd(perf_fds[3]),
                 .branch_misses = readPerfFd(perf_fds[4]),
+                .idq_uops_nd_core = readPerfFd(perf_fds[5]),
+                .mem_ld_rt_fbh = readPerfFd(perf_fds[6]),
             };
             for (&perf_fds) |*perf_fd| {
                 std.posix.close(perf_fd.*);
@@ -325,6 +382,8 @@ pub fn main() !void {
             .cache_references = Measurement.compute(all_samples, "cache_references", .count),
             .cache_misses = Measurement.compute(all_samples, "cache_misses", .count),
             .branch_misses = Measurement.compute(all_samples, "branch_misses", .count),
+            .idq_uops_nd_core = Measurement.compute(all_samples, "idq_uops_nd_core", .count),
+            .mem_ld_rt_fbh = Measurement.compute(all_samples, "mem_ld_rt_fbh", .count),
         };
         command.sample_count = all_samples.len;
 
