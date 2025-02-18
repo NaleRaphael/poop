@@ -3,8 +3,11 @@ const PERF = std.os.linux.PERF;
 const fd_t = std.posix.fd_t;
 const pid_t = std.os.pid_t;
 const assert = std.debug.assert;
+const Allocator = std.mem.Allocator;
 const progress = @import("./progress.zig");
+const events = @import("./events.zig");
 const MAX_SAMPLES = 10000;
+const MIN_SAMPLES = 3;
 
 const usage_text =
     \\Usage: poop [options] <command1> ... <commandN>
@@ -15,127 +18,119 @@ const usage_text =
     \\ -d, --duration <ms>    (default: 5000) how long to repeatedly sample each command
     \\ --color <when>         (default: auto) color output mode
     \\                            available options: 'auto', 'never', 'ansi'
+    \\ -e, --events <list>    (default: '') a comma-separated event list (see also the
+    \\                            output of `$ perf list`)
     \\
 ;
 
-const PerfType = enum { hw, raw };
-const PerfConfig = union(PerfType) {
-    hw: PERF.COUNT.HW,
-    raw: struct {
-        event: u8 = 0,
-        umask: u8 = 0,
-        edge: u8 = 0,
-        inv: u8 = 0,
-        cmask: u8 = 0,
+const PerfType = events.PerfType;
+const PerfConfig = events.PerfConfig;
+const PerfMeasurement = events.PerfMeasurement;
+const available_perf_measurements = events.available_perf_measurements;
 
-        const Self = @This();
-        pub fn value(self: Self) u64 {
-            // Based on: https://github.com/Maratyszcza/NNPACK/blob/70a77f4/bench/perf_counter.c#L717-L721
-            return (@as(u64, self.event) |
-                @as(u64, self.umask) << 8 |
-                @as(u64, self.edge) << 18 |
-                @as(u64, self.inv) << 23 |
-                @as(u64, self.cmask) << 24);
-        }
-    },
-
-    pub fn value(self: PerfConfig) u64 {
-        return switch (self) {
-            .hw => |v| @intFromEnum(v),
-            .raw => |v| v.value(),
-        };
-    }
-
-    pub fn perfType(self: PerfConfig) PERF.TYPE {
-        return switch (self) {
-            .hw => PERF.TYPE.HARDWARE,
-            .raw => PERF.TYPE.RAW,
-        };
-    }
-};
-
-const PerfMeasurement = struct {
-    name: []const u8,
-    config: PerfConfig,
-};
-
-// NOTE: Some useful resources for defining new measurements:
-// https://github.com/Maratyszcza/NNPACK/blob/master/bench/perf_counter.c
-// https://github.com/torvalds/linux/blob/7ff71e6d/arch/x86/events/intel/core.c#L6812-L6817
-// https://github.com/torvalds/linux/blob/7ff71e6d/arch/x86/events/perf_event.h#L637-L658
-const perf_measurements = [_]PerfMeasurement{
+const default_perf_measurements = [_]PerfMeasurement{
     .{ .name = "cpu_cycles", .config = .{ .hw = PERF.COUNT.HW.CPU_CYCLES } },
     .{ .name = "instructions", .config = .{ .hw = PERF.COUNT.HW.INSTRUCTIONS } },
     .{ .name = "cache_references", .config = .{ .hw = PERF.COUNT.HW.CACHE_REFERENCES } },
     .{ .name = "cache_misses", .config = .{ .hw = PERF.COUNT.HW.CACHE_MISSES } },
     .{ .name = "branch_misses", .config = .{ .hw = PERF.COUNT.HW.BRANCH_MISSES } },
-    .{
-        // XXX: If we want to support longer name, remember to fix the space
-        // calculation in `printMeasurement()` below.
-        .name = "idq_uops_nd_core", // idq_uops_not_delivered.core
-        .config = .{ .raw = .{ .event = 0x9c, .umask = 0x01 } },
-    },
-    .{
-        .name = "mem_ld_rt_fbh", // mem_load_retired.fb_hit
-        .config = .{ .raw = .{ .event = 0xd1, .umask = 0x40 } },
-    },
-    .{
-        .name = "res_stalls_sb", // resource_stalls.sb
-        .config = .{ .raw = .{ .event = 0xa2, .umask = 0x08 } },
-    },
 };
 
-// nah, i don't want to fix the name length issue for now...
-comptime {
-    for (perf_measurements) |m| {
-        if (m.name.len > 16) {
-            @compileError(std.fmt.comptimePrint("Please consider restricting the name within 16 characters: {s}", .{m.name}));
-        }
-    }
-}
+// Basic measurements that are not calculated by perf
+const BASIC_MEASUREMENTS = [_]Measurement.Info{
+    .{ .name = "wall_time", .unit = .nanoseconds },
+    .{ .name = "peak_rss", .unit = .bytes },
+};
+
+const NamedMeasurement = struct {
+    name: []const u8,
+    data: Measurement,
+};
 
 const Command = struct {
     raw_cmd: []const u8,
     argv: []const []const u8,
-    measurements: Measurements,
+    measurements: measurements_t,
     sample_count: usize,
+    allocator: Allocator,
 
-    const Measurements = struct {
-        wall_time: Measurement,
-        peak_rss: Measurement,
-        cpu_cycles: Measurement,
-        instructions: Measurement,
-        cache_references: Measurement,
-        cache_misses: Measurement,
-        branch_misses: Measurement,
-        idq_uops_nd_core: Measurement,
-        mem_ld_rt_fbh: Measurement,
-        res_stalls_sb: Measurement,
-    };
+    pub const measurements_t = std.MultiArrayList(NamedMeasurement);
+
+    pub fn init(allocator: Allocator, raw_cmd: []const u8, argv: []const []const u8) !Command {
+        return .{
+            .raw_cmd = raw_cmd,
+            .argv = argv,
+            .measurements = measurements_t{},
+            .sample_count = undefined,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *Command) void {
+        self.measurements.deinit(self.allocator);
+    }
+
+    pub fn initMeasurements(self: *Command, names: []const []const u8) !void {
+        // Make sure this function has not been called before
+        assert(self.measurements.len == 0);
+
+        for (BASIC_MEASUREMENTS) |m| {
+            try self.measurements.append(self.allocator, .{ .name = m.name, .data = undefined });
+        }
+        for (names) |name| {
+            try self.measurements.append(self.allocator, .{ .name = name, .data = undefined });
+        }
+    }
+
+    pub fn updateMeasurements(self: *Command, samples: []Sample) !void {
+        assert(samples.len >= MIN_SAMPLES);
+        assert(samples[0].metrics.items.len == self.measurements.len);
+
+        const data: []Measurement = self.measurements.items(.data);
+
+        for (BASIC_MEASUREMENTS, 0..BASIC_MEASUREMENTS.len) |m, i| {
+            data[i] = Measurement.compute(samples, i, m.unit);
+        }
+
+        // XXX: we can only take all remaining perf events as counters here...
+        for (BASIC_MEASUREMENTS.len..self.measurements.len) |i| {
+            data[i] = Measurement.compute(samples, i, .count);
+        }
+    }
+};
+
+const NamedValue = struct {
+    name: []const u8,
+    value: u64,
 };
 
 const Sample = struct {
-    wall_time: u64,
-    cpu_cycles: u64,
-    instructions: u64,
-    cache_references: u64,
-    cache_misses: u64,
-    branch_misses: u64,
-    peak_rss: u64,
-    idq_uops_nd_core: u64,
-    mem_ld_rt_fbh: u64,
-    res_stalls_sb: u64,
+    metrics: ArrayList,
 
-    pub fn lessThanContext(comptime field: []const u8) type {
-        return struct {
-            fn lessThan(
-                _: void,
-                lhs: Sample,
-                rhs: Sample,
-            ) bool {
-                return @field(lhs, field) < @field(rhs, field);
-            }
-        };
+    pub const ArrayList = std.ArrayList(u64);
+    pub const Slice = ArrayList.Slice;
+    pub const CmpCtx = struct { field_idx: usize };
+
+    pub fn create(allocator: Allocator, wall_time: u64, peak_rss: u64, perf_fds: []fd_t) !Sample {
+        var metrics = try ArrayList.initCapacity(allocator, BASIC_MEASUREMENTS.len + perf_fds.len);
+
+        try metrics.append(wall_time);
+        try metrics.append(peak_rss);
+        for (perf_fds) |fd| {
+            try metrics.append(readPerfFd(fd));
+        }
+
+        assert(metrics.items.len == (BASIC_MEASUREMENTS.len + perf_fds.len));
+        return .{ .metrics = metrics };
+    }
+
+    pub fn deinit(self: *Sample) void {
+        self.metrics.deinit();
+    }
+
+    pub fn lessThan(ctx: CmpCtx, lhs: Sample, rhs: Sample) bool {
+        const field_idx = ctx.field_idx;
+        return lhs.metrics.items[field_idx] < rhs.metrics.items[field_idx];
     }
 };
 
@@ -159,6 +154,7 @@ pub fn main() !void {
     var commands = std.ArrayList(Command).init(arena);
     var max_nano_seconds: u64 = std.time.ns_per_s * 5;
     var color: ColorMode = .auto;
+    var query_events = std.ArrayList([]const u8).init(arena);
 
     var arg_i: usize = 1;
     while (arg_i < args.len) : (arg_i += 1) {
@@ -166,12 +162,8 @@ pub fn main() !void {
         if (!std.mem.startsWith(u8, arg, "-")) {
             var cmd_argv = std.ArrayList([]const u8).init(arena);
             try parseCmd(&cmd_argv, arg);
-            try commands.append(.{
-                .raw_cmd = arg,
-                .argv = try cmd_argv.toOwnedSlice(),
-                .measurements = undefined,
-                .sample_count = undefined,
-            });
+            const cmd = try Command.init(arena, arg, try cmd_argv.toOwnedSlice());
+            try commands.append(cmd);
         } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             try stdout.writeAll(usage_text);
             return std.process.cleanExit();
@@ -207,6 +199,17 @@ pub fn main() !void {
                 , .{next});
                 std.process.exit(1);
             }
+        } else if (std.mem.eql(u8, arg, "-e") or std.mem.eql(u8, arg, "--events")) {
+            arg_i += 1;
+            if (arg_i >= args.len) {
+                std.debug.print("'{s}' requires a comma-separated event list.\n{s}", .{ arg, usage_text });
+                std.process.exit(1);
+            }
+            const next = args[arg_i];
+            var it = std.mem.splitScalar(u8, next, ',');
+            while (it.next()) |v| {
+                try query_events.append(v);
+            }
         } else {
             std.debug.print("unrecognized argument: '{s}'\n{s}", .{ arg, usage_text });
             std.process.exit(1);
@@ -226,7 +229,49 @@ pub fn main() !void {
         .ansi => .escape_codes,
     };
 
-    var perf_fds = [1]fd_t{-1} ** perf_measurements.len;
+    // Collect events to monitor by perf
+    var perf_measurement_al = std.MultiArrayList(PerfMeasurement){};
+    defer perf_measurement_al.deinit(arena);
+
+    // - default events
+    for (default_perf_measurements) |m| {
+        try perf_measurement_al.append(arena, m);
+    }
+
+    // - user specified events
+    for (query_events.items) |query| {
+        var found = false;
+        for (available_perf_measurements) |m| {
+            if (std.mem.eql(u8, m.full_name, query)) {
+                try perf_measurement_al.append(arena, m);
+                found = true;
+                break;
+            }
+        }
+
+        if (!found) {
+            std.debug.print("failed to find event definition for: {s}\n", .{query});
+            return error.EventIsNotAvailable;
+        }
+    }
+
+    const perf_measurements = perf_measurement_al.slice();
+    const event_names: []const []const u8 = perf_measurements.items(.name);
+    const perf_configs: []PerfConfig = perf_measurements.items(.config);
+
+    // Initialize measurements for each command
+    for (commands.items) |*cmd| {
+        try cmd.initMeasurements(event_names);
+    }
+
+    // Initialize list of fd for perf
+    var perf_fd_al = std.ArrayList(fd_t).init(arena);
+    defer perf_fd_al.deinit();
+    for (0..perf_measurements.len) |_| {
+        try perf_fd_al.append(-1);
+    }
+
+    const perf_fds = perf_fd_al.items;
     var samples_buf: [MAX_SAMPLES]Sample = undefined;
 
     var stderr_buffer: [4096]u8 = undefined;
@@ -246,7 +291,7 @@ pub fn main() !void {
         };
         _ = prog_name;
 
-        const min_samples = 3;
+        const min_samples = MIN_SAMPLES;
 
         const first_start = timer.read();
         var sample_index: usize = 0;
@@ -255,10 +300,10 @@ pub fn main() !void {
             sample_index < samples_buf.len) : (sample_index += 1)
         {
             if (tty_conf != .no_color) try bar.render();
-            for (perf_measurements, &perf_fds) |measurement, *perf_fd| {
+            for (perf_configs, perf_fds) |config, *perf_fd| {
                 var attr: std.os.linux.perf_event_attr = .{
-                    .type = measurement.config.perfType(),
-                    .config = measurement.config.value(),
+                    .type = config.perfType(),
+                    .config = config.value(),
                     .flags = .{
                         .disabled = true,
                         .exclude_kernel = true,
@@ -352,19 +397,10 @@ pub fn main() !void {
                 },
             }
 
-            samples_buf[sample_index] = .{
-                .wall_time = end - start,
-                .peak_rss = peak_rss,
-                .cpu_cycles = readPerfFd(perf_fds[0]),
-                .instructions = readPerfFd(perf_fds[1]),
-                .cache_references = readPerfFd(perf_fds[2]),
-                .cache_misses = readPerfFd(perf_fds[3]),
-                .branch_misses = readPerfFd(perf_fds[4]),
-                .idq_uops_nd_core = readPerfFd(perf_fds[5]),
-                .mem_ld_rt_fbh = readPerfFd(perf_fds[6]),
-                .res_stalls_sb = readPerfFd(perf_fds[7]),
-            };
-            for (&perf_fds) |*perf_fd| {
+            const wall_time = end - start;
+            samples_buf[sample_index] = try Sample.create(arena, wall_time, peak_rss, perf_fds);
+
+            for (perf_fds) |*perf_fd| {
                 std.posix.close(perf_fd.*);
                 perf_fd.* = -1;
             }
@@ -388,19 +424,13 @@ pub fn main() !void {
         }
 
         const all_samples = samples_buf[0..sample_index];
+        defer {
+            for (all_samples) |*sample| {
+                sample.deinit();
+            }
+        }
 
-        command.measurements = .{
-            .wall_time = Measurement.compute(all_samples, "wall_time", .nanoseconds),
-            .peak_rss = Measurement.compute(all_samples, "peak_rss", .bytes),
-            .cpu_cycles = Measurement.compute(all_samples, "cpu_cycles", .count),
-            .instructions = Measurement.compute(all_samples, "instructions", .count),
-            .cache_references = Measurement.compute(all_samples, "cache_references", .count),
-            .cache_misses = Measurement.compute(all_samples, "cache_misses", .count),
-            .branch_misses = Measurement.compute(all_samples, "branch_misses", .count),
-            .idq_uops_nd_core = Measurement.compute(all_samples, "idq_uops_nd_core", .count),
-            .mem_ld_rt_fbh = Measurement.compute(all_samples, "mem_ld_rt_fbh", .count),
-            .res_stalls_sb = Measurement.compute(all_samples, "res_stalls_sb", .count),
-        };
+        try command.updateMeasurements(all_samples);
         command.sample_count = all_samples.len;
 
         {
@@ -451,13 +481,23 @@ pub fn main() !void {
 
             try stdout_w.writeAll("\n");
 
-            inline for (@typeInfo(Command.Measurements).Struct.fields) |field| {
-                const measurement = @field(command.measurements, field.name);
-                const first_measurement = if (command_n == 1)
-                    null
-                else
-                    @field(commands.items[0].measurements, field.name);
-                try printMeasurement(tty_conf, stdout_w, measurement, field.name, first_measurement, commands.items.len);
+            const ms = command.measurements.slice();
+            for (0..ms.len) |i| {
+                const item = ms.get(i);
+                const name = item.name;
+                const measurement = item.data;
+
+                // This one is actually the i-th measurement in the first command
+                // (we are comparing each measurement in "current command" and
+                // "the first command")
+                const first_measurement = blk: {
+                    if (command_n == 1) {
+                        break :blk null;
+                    } else {
+                        break :blk commands.items[0].measurements.items(.data)[i];
+                    }
+                };
+                try printMeasurement(tty_conf, stdout_w, measurement, name, first_measurement, commands.items.len);
             }
 
             try stdout_bw.flush(); // 💩
@@ -493,20 +533,25 @@ const Measurement = struct {
     sample_count: u64,
     unit: Unit,
 
-    const Unit = enum {
+    pub const Info = struct {
+        name: []const u8,
+        unit: Unit,
+    };
+
+    pub const Unit = enum {
         nanoseconds,
         bytes,
         count,
     };
 
-    fn compute(samples: []Sample, comptime field: []const u8, unit: Unit) Measurement {
-        std.mem.sort(Sample, samples, {}, Sample.lessThanContext(field).lessThan);
+    fn compute(samples: []Sample, field_idx: usize, unit: Unit) Measurement {
+        std.mem.sort(Sample, samples, Sample.CmpCtx{ .field_idx = field_idx }, Sample.lessThan);
         // Compute stats
         var total: u64 = 0;
         var min: u64 = std.math.maxInt(u64);
         var max: u64 = 0;
         for (samples) |s| {
-            const v = @field(s, field);
+            const v = s.metrics.items[field_idx];
             total += v;
             if (v < min) min = v;
             if (v > max) max = v;
@@ -514,7 +559,7 @@ const Measurement = struct {
         const mean = @as(f64, @floatFromInt(total)) / @as(f64, @floatFromInt(samples.len));
         var std_dev: f64 = 0;
         for (samples) |s| {
-            const v = @field(s, field);
+            const v = s.metrics.items[field_idx];
             const delta: f64 = @as(f64, @floatFromInt(v)) - mean;
             std_dev += delta * delta;
         }
@@ -523,20 +568,21 @@ const Measurement = struct {
             std_dev = @sqrt(std_dev);
         }
 
-        const q1 = @field(samples[samples.len / 4], field);
-        const q3 = if (samples.len < 4) @field(samples[samples.len - 1], field) else @field(samples[samples.len - samples.len / 4], field);
+        const q1 = samples[samples.len / 4].metrics.items[field_idx];
+        const q3 = if (samples.len < 4) samples[samples.len - 1].metrics.items[field_idx] else samples[samples.len - samples.len / 4].metrics.items[field_idx];
+
         // Tukey's Fences outliers
         var outlier_count: u64 = 0;
         const iqr: f64 = @floatFromInt(q3 - q1);
         const low_fence = @as(f64, @floatFromInt(q1)) - 1.5 * iqr;
         const high_fence = @as(f64, @floatFromInt(q3)) + 1.5 * iqr;
         for (samples) |s| {
-            const v: f64 = @floatFromInt(@field(s, field));
+            const v: f64 = @floatFromInt(s.metrics.items[field_idx]);
             if (v < low_fence or v > high_fence) outlier_count += 1;
         }
         return .{
             .q1 = q1,
-            .median = @field(samples[samples.len / 2], field),
+            .median = samples[samples.len / 2].metrics.items[field_idx],
             .q3 = q3,
             .mean = mean,
             .min = min,
